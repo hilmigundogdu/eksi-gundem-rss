@@ -1,22 +1,28 @@
 # ekşi sözlük gündem RSS
 
-Ekşi Sözlük ana sayfasındaki gündemi RSS 2.0 beslemesine çevirir. Her gündem başlığı bir öğedir; öğede başlığın entry sayısı ve en beğenilen ilk 10 entry (metin, yazar, beğeni sayısı, entry bağlantılı tarih) bulunur.
+Ekşi Sözlük gündemini ve günlük debeyi RSS 2.0 beslemesine çevirir.
 
 **Besleme:** https://hilmigundogdu.github.io/eksi-gundem-rss/feed.xml
+
+## Öğeler
+
+- **Gündem başlığı:** başlık `(182) - başlık adı` biçimindedir; entry sayısı her çalışmada güncellenir, guid değişmez. İçerikte en beğenilen ilk 10 entry vardır (metin, yazar, beğeni sayısı, entry'nin kalıcı bağlantısı olan tarih). `pubDate`, başlığın gündemde ilk görüldüğü andır.
+- **Debe:** her gün bir önceki günün debesi tek öğedir: `debe - 24.10.2026`. İçerikte debedeki tüm entry'ler sırasıyla bulunur (başlık adı, metin, yazar, beğeni, tarih). `pubDate`, debenin ilk çekildiği andır.
 
 ## Nasıl çalışır
 
 - GitHub Actions her 30 dakikada `gundem.mjs`'i çalıştırır ve çıktıyı GitHub Pages'te yayımlar. Depoya commit atılmaz.
 - Ekşi, düz istekleri Cloudflare challenge'ına düşürdüğü için sayfalar doğrudan değil, [Jina Reader](https://jina.ai/reader/) (`r.jina.ai`) üzerinden okunur. Anahtarsız kullanılır; istekler sırayla ve aralarında en az 3,5 saniye olacak şekilde gider (sınır dakikada 20 istek).
-- Durum ayrıca saklanmaz: her çalışma yayımlanmış beslemeyi okur, başlıkların ilk görülme tarihini (`pubDate`) ve çekilmiş entry'lerini taşır.
-- Bir çalışmada en çok 15 başlık sayfası çekilir. Öncelik hiç çekilmemiş başlıklardadır; gündemde kalan başlığın entry'leri en çok 6 saatte bir yenilenir. Sığmayan başlık o çalışmada yalnız entry sayısıyla yayımlanır.
-- Gündemden düşen başlıklar 3 gün, en çok 150 öğe olarak tutulur.
-- Jina ana sayfayı getiremezse iş düşer ve eski besleme yerinde kalır. Tek bir başlık sayfası düşerse yalnız o başlık sonraki çalışmaya kalır.
+- Durum ayrıca saklanmaz: her çalışma yayımlanmış beslemeyi okur; ilk görülme tarihlerini, çekilmiş entry'leri ve debe listesini taşır.
+- Bir çalışmada ana sayfa ve debe listesi dışında en çok 30 sayfa çekilir. Öncelik debededir; kalan bütçe gündem başlıklarına gider. Gündemde öncelik hiç çekilmemiş başlıklardadır; gündemde kalan başlığın entry'leri en çok 6 saatte bir yenilenir. Bütçeye sığmayan başlık o çalışmada yalnız sayıyla yayımlanır; yarım kalan debe sonraki çalışmalarda yerinde tamamlanır.
+- **Debe kuralı:** Zamanlama UTC'dir (`*/30`), gün kuralı betikte İstanbul saatiyle uygulanır. 00:00'dan (21:00 UTC) sonraki ilk çalışmada dünün debesi aranır ve doldurulmaya başlar. Ekşi debeyi henüz yenilememişse (liste elde olan debeyle aynıysa) yeni gün açılmaz, sonraki çalışmalarda yeniden denenir; debenin günü entry tarihlerinden çıkarılır. Gün içinde dünün debesi tamamsa debe için hiç istek atılmaz, bütçenin tamamı gündeme kalır. Debede çekilemeyen entry 24 saat boyunca yeniden denenir.
+- Gündemden düşen başlıklar 3 gün, en çok 150 öğe; debe öğeleri 7 gün tutulur.
+- Jina ana sayfayı getiremezse iş düşer ve eski besleme yerinde kalır. Debe listesi ya da tek bir sayfa düşerse yalnız o kısım sonraki çalışmaya kalır.
 - Workflow günde bir kez kendini etkin tutar; GitHub 60 gün etkinlik olmayan depoda zamanlanmış işi kapatır.
 
 Yerel deneme (Node 18+, bağımlılık yok):
 
 ```sh
-node gundem.mjs --out /tmp/eksi --budget 2            # sıfırdan, 2 başlık sayfası
-node gundem.mjs --prev /tmp/eksi/feed.xml --out /tmp/eksi2 --budget 2
+node gundem.mjs --out /tmp/eksi --budget 3            # sıfırdan, 3 sayfa
+node gundem.mjs --prev /tmp/eksi/feed.xml --out /tmp/eksi2 --budget 3
 ```
