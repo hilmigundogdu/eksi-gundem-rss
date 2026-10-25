@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// Ekşi Sözlük gündemini ve günlük debeyi RSS 2.0 beslemesine çevirir. Bağımlılık yok (Node 18+).
+// Ekşi Sözlük gündemini (feed.xml) ve günlük debeyi (debe.xml, her entry ayrı öğe) RSS 2.0 beslemelerine çevirir. Bağımlılık yok (Node 18+).
 // Ekşi'ye doğrudan istek atılmaz: Cloudflare düz isteği challenge'a düşürdüğü için sayfalar Jina Reader (r.jina.ai) üzerinden okunur.
 //
-// Ortam:  FEED_URL  yayımlanmış beslemenin adresi; ilk görülme tarihleri ve çekilmiş entry'ler buradan taşınır.
+// Ortam:  FEED_URL  yayımlanmış gündem beslemesinin adresi; debe beslemesi yanındaki debe.xml'dir. İlk görülme tarihleri
+//                   ve çekilmiş entry'ler bu iki beslemeden taşınır.
 //         OUT_DIR   çıktı klasörü (varsayılan: public).
-// Yerel deneme:  node gundem.mjs [--prev eski-feed.xml] [--out klasor] [--budget 3]
+// Yerel deneme:  node gundem.mjs [--prev eski-feed.xml] [--prev-debe eski-debe.xml] [--out klasor] [--budget 3]
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -18,18 +19,21 @@ const USER_AGENT = `eksi-gundem-rss/1.0 (+${REPO})`;
 const TIMEOUT_MS = 45_000;
 const GAP_MS = 3_500;                       // Jina istekleri arasındaki en kısa ara (anahtarsız sınır dakikada 20 istek)
 const HOUR = 60 * 60 * 1000, DAY = 24 * HOUR;
-const ENTRIES_PER_TOPIC = 10;
+const ENTRIES_PER_TOPIC = 20;               // gündem başlığı başına en beğenilen entry; Ekşi sayfada 10 gösterdiği için iki sayfa
 const REFRESH_MS = 6 * HOUR;                // gündemde kalan başlığın entry'leri en çok bu sıklıkla yenilenir
 const KEEP_MS = 3 * DAY;                    // gündemden düşen başlık son görülmesinden sonra bu kadar süre beslemede kalır
-const MAX_ITEMS = 150;                      // gündem öğesi sınırı (debe öğeleri ayrı)
-const DEBE_KEEP_MS = 7 * DAY;               // debe öğesi ilk çekilmesinden sonra bu kadar süre beslemede kalır
+const MAX_ITEMS = 150;                      // gündem öğesi sınırı
+const DEBE_KEEP_MS = 14 * DAY;              // debe günü ilk çekilmesinden sonra bu kadar süre beslemede kalır
 const DEBE_RETRY_MS = DAY;                  // debede düşen entry bu süre boyunca yeniden denenir; silinmiş entry sonsuza dek istek yemez
 
-const { values: args } = parseArgs({ options: { prev: { type: 'string' }, out: { type: 'string' }, budget: { type: 'string' } } });
+const { values: args } = parseArgs({ options: {
+  prev: { type: 'string' }, 'prev-debe': { type: 'string' }, out: { type: 'string' }, budget: { type: 'string' },
+} });
 const feedUrl = process.env.FEED_URL || '';
+const debeFeedUrl = feedUrl && new URL('debe.xml', feedUrl).href;
 const outDir = args.out || process.env.OUT_DIR || 'public';
-// Bir çalışmada çekilecek en çok ayrıntı sayfası (debe entry'leri + gündem başlıkları); ana sayfa ve debe listesi buna girmez.
-const budget = Math.max(0, Number(args.budget ?? 30) || 0);
+// Bir çalışmada çekilecek en çok ayrıntı sayfası (debe entry'leri + gündem sayfaları); ana sayfa ve debe listesi buna girmez.
+const budget = Math.max(0, Number(args.budget ?? 60) || 0);
 
 const ENTITIES = new Map(Object.entries({
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', hellip: '…', ndash: '–', mdash: '—',
@@ -166,7 +170,8 @@ function cleanContent(html) {
   return out.replace(/^(\s|<br>)+|(\s|<br>)+$/g, '');
 }
 
-// Başlık sayfası da tek entry sayfası da aynı yapıda: h1#title ve entry'ler (li[data-id][data-author]).
+// Başlık sayfası da tek entry sayfası da aynı yapıda: h1#title ve entry'ler (li[data-id][data-author]); başlık sayfasında
+// div.pager[data-pagecount] sayfa sayısını verir.
 function parsePage(html) {
   const h1 = /<h1\b[^>]*\bid\s*=\s*["']title["'][^>]*>/i.exec(html);
   if (!h1) throw new Error('h1#title yok');
@@ -188,45 +193,44 @@ function parsePage(html) {
       date: permalink ? text(permalink[2]) : '',
       url: absUrl(permalink ? attrsOf(permalink[1]).href ?? '' : '') ?? `${SITE}/entry/${a['data-id']}`,
     });
-    if (entries.length === ENTRIES_PER_TOPIC) break;
   }
   if (!entries.length) throw new Error('entry bulunamadı');
-  return { id, slug, title: title.trim(), entries };
+  const pager = /<div\b[^>]*\bclass\s*=\s*["']pager["'][^>]*>/i.exec(html);
+  return { id, slug, title: title.trim(), entries, pages: Number(pager && attrsOf(pager[0])['data-pagecount']) || 1 };
 }
 
-const renderEntry = e =>
-  `<blockquote><p>${e.html}</p></blockquote>\n<p>— ${esc(e.author)} · ${e.favorites} beğeni · <a href="${esc(e.url)}">${esc(e.date || 'entry')}</a></p>`;
+const entryFooter = e => `<p>— ${esc(e.author)} · ${e.favorites} beğeni · <a href="${esc(e.url)}">${esc(e.date || 'entry')}</a></p>`;
+const renderEntry = e => `<blockquote><p>${e.html}</p></blockquote>\n${entryFooter(e)}`;
 
-// Debe entry'si: önce başlık (başlığa bağlantılı), sonra gündemdeki gibi metin ve alt satır. Sıra numarası yazarken eklenir.
-function renderDebeEntry(page, entry, caption) {
-  const title = page.title || caption || 'entry';
-  const topicUrl = page.slug && page.id ? `${SITE}/${page.slug}--${page.id}` : `${SITE}/?q=${encodeURIComponent(title)}`;
-  return `<p><a href="${esc(topicUrl)}"><strong>${esc(title)}</strong></a></p>\n${renderEntry(entry)}`;
+// Debe entry'si tek öğedir: metin, alt satır ve başlığın bağlantısı. Sıra numarası yalnız öğe başlığındadır, yazarken eklenir.
+function debeEntry(page, entry, caption) {
+  const topic = page.title || caption || 'entry';
+  const topicUrl = page.slug && page.id ? `${SITE}/${page.slug}--${page.id}` : `${SITE}/?q=${encodeURIComponent(topic)}`;
+  return { topic, link: entry.url, author: entry.author,
+    description: `<p>${entry.html}</p>\n${entryFooter(entry)}\n<p>başlık: <a href="${esc(topicUrl)}">${esc(topic)}</a></p>` };
 }
 
-const DEBE_SEPARATOR = '\n<hr>\n';
-const debeHtml = debe => debe.ids.map((id, i) => debe.chunks.get(id)?.replace(/^<p>/, `<p>${i + 1}. `)).filter(Boolean).join(DEBE_SEPARATOR);
+// Önceki beslemeleri biz ürettiğimiz için düzenli ifadeyle okumak yeterli.
+const xmlItems = body => [...body.matchAll(/<item>([\s\S]*?)<\/item>/g)].map(m => m[1]);
+const raw = (item, tag) => new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`).exec(item)?.[1] ?? '';
+const field = (item, tag) => decode(raw(item, tag)).trim();
+function description(item) {
+  const value = raw(item, 'description');
+  return (value.includes('<![CDATA[') ? value.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1') : decode(value)).trim();
+}
 
-// Önceki beslemeyi biz ürettiğimiz için düzenli ifadeyle okumak yeterli.
 function parseFeedXml(body) {
-  if (!/<rss\b/.test(body)) throw new Error('Önceki besleme RSS değil; tarihler kaybolmasın diye yayın yapılmadı.');
-  const raw = (item, tag) => new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`).exec(item)?.[1] ?? '';
-  const field = (item, tag) => decode(raw(item, tag)).trim();
+  if (!/<rss\b/.test(body)) throw new Error('Önceki gündem beslemesi RSS değil; tarihler kaybolmasın diye yayın yapılmadı.');
   const topics = [], debes = [];
-  for (const [, item] of body.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
+  for (const item of xmlItems(body)) {
     const guid = field(item, 'guid'), firstSeen = Date.parse(field(item, 'pubDate'));
     if (!Number.isFinite(firstSeen)) continue;
-    const descRaw = raw(item, 'description');
-    const desc = (descRaw.includes('<![CDATA[') ? descRaw.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1') : decode(descRaw)).trim();
+    const desc = description(item);
 
+    // Geçiş: debe eskiden bu beslemede günlük tek öğeydi. debe.xml yokken yalnız liste ve tarih alınır, entry'ler yeniden çekilir.
     const debeDay = /\/debe#(\d{4}-\d{2}-\d{2})$/.exec(guid)?.[1];
     if (debeDay) {
-      const chunks = new Map();
-      for (const chunk of desc ? desc.split(DEBE_SEPARATOR) : []) {
-        const id = [...chunk.matchAll(/\/entry\/(\d+)">/g)].at(-1)?.[1];   // son bağlantı alt satırdaki kalıcı bağlantıdır
-        if (id) chunks.set(id, chunk.replace(/^<p>\d+\. /, '<p>'));
-      }
-      debes.push({ day: debeDay, guid, ids: field(item, 'egr:debeIds').split(/\s+/).filter(Boolean), chunks, firstSeen });
+      debes.push({ day: debeDay, ids: field(item, 'egr:debeIds').split(/\s+/).filter(Boolean), entries: new Map(), firstSeen });
       continue;
     }
 
@@ -247,16 +251,44 @@ function parseFeedXml(body) {
   return { topics, debes };
 }
 
-async function loadPrevious() {
-  if (args.prev) return parseFeedXml(await readFile(args.prev, 'utf8'));
-  if (!feedUrl) { console.log('FEED_URL yok; önceki besleme okunmadı, sıfırdan başlanıyor.'); return { topics: [], debes: [] }; }
-  const res = await fetch(`${feedUrl}?t=${Date.now()}`, { headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(TIMEOUT_MS) });
-  if (res.status === 404) { console.log('Önceki besleme yok (404); sıfırdan başlanıyor.'); return { topics: [], debes: [] }; }
-  if (!res.ok) throw new Error(`Önceki besleme okunamadı (HTTP ${res.status}); tarihler kaybolmasın diye yayın yapılmadı.`);
-  return parseFeedXml(await res.text());
+// Debe beslemesi: her entry bir öğe (guid entry adresi); günlerin listesi ve ilk çekilme anı kanaldaki egr:debe öğelerindedir.
+function parseDebeXml(body) {
+  if (!/<rss\b/.test(body)) throw new Error('Önceki debe beslemesi RSS değil; tarihler kaybolmasın diye yayın yapılmadı.');
+  const entries = new Map();
+  for (const item of xmlItems(body)) {
+    const id = /\/entry\/(\d+)$/.exec(field(item, 'guid'))?.[1];
+    if (id) entries.set(id, { topic: field(item, 'egr:topic'), link: field(item, 'link'), author: field(item, 'dc:creator'), description: description(item) });
+  }
+  const debes = [];
+  for (const [, attrs, list] of body.matchAll(/<egr:debe\b([^>]*)>([^<]*)<\/egr:debe>/g)) {
+    const { day, seen } = attrsOf(attrs), firstSeen = Date.parse(seen);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day ?? '') || !Number.isFinite(firstSeen)) continue;
+    const ids = list.split(/\s+/).filter(Boolean);
+    debes.push({ day, ids, entries: new Map(ids.filter(id => entries.has(id)).map(id => [id, entries.get(id)])), firstSeen });
+  }
+  return debes;
 }
 
-// Debe: her gün bir önceki günün debesi tek öğe. Liste yalnız dünün (İstanbul) debesi elde yokken çekilir; böylece
+async function readPrevious(file, url, label) {
+  if (file) return readFile(file, 'utf8');
+  if (!url) return null;
+  const res = await fetch(`${url}?t=${Date.now()}`, { headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(TIMEOUT_MS) });
+  if (res.status === 404) { console.log(`Önceki ${label} yok (404).`); return null; }
+  if (!res.ok) throw new Error(`Önceki ${label} okunamadı (HTTP ${res.status}); tarihler kaybolmasın diye yayın yapılmadı.`);
+  return res.text();
+}
+
+async function loadPrevious() {
+  if (!args.prev && !feedUrl) console.log('FEED_URL yok; önceki beslemeler okunmadı, sıfırdan başlanıyor.');
+  const [feed, debe] = await Promise.all([
+    readPrevious(args.prev, feedUrl, 'gündem beslemesi'), readPrevious(args['prev-debe'], debeFeedUrl, 'debe beslemesi'),
+  ]);
+  const { topics, debes: legacy } = feed ? parseFeedXml(feed) : { topics: [], debes: [] };
+  if (!debe && legacy.length) console.log(`Debe beslemesi yok; gündem beslemesindeki ${legacy.length} eski debe günü taşınıyor.`);
+  return { topics, debes: debe ? parseDebeXml(debe) : legacy };
+}
+
+// Debe: her gün bir önceki günün debesi. Liste yalnız dünün (İstanbul) debesi elde yokken çekilir; böylece
 // İstanbul'da 00:00'dan sonraki ilk çalışmada yeni gün aranır, gün içinde debe tamamsa hiç istek gitmez.
 // Liste elde olan bir debeyle aynıysa (Ekşi henüz yenilememiş) yeni gün açılmaz; gün, çekilen entry'lerin tarihinden çıkarılır.
 async function updateDebe(previous, now, limit) {
@@ -274,7 +306,7 @@ async function updateDebe(previous, now, limit) {
         Object.assign(same, { ids: list.ids, captions: list.captions });
         work = same;
       } else {
-        work = { ids: list.ids, captions: list.captions, chunks: new Map(), firstSeen: now };
+        work = { ids: list.ids, captions: list.captions, entries: new Map(), firstSeen: now };
         fresh = true;
       }
     } catch (error) {
@@ -283,7 +315,7 @@ async function updateDebe(previous, now, limit) {
     }
   }
 
-  const missing = work.ids.filter(id => !work.chunks.has(id));
+  const missing = work.ids.filter(id => !work.entries.has(id));
   const retry = fresh || now - work.firstSeen <= DEBE_RETRY_MS;
   const queue = retry ? missing.slice(0, limit) : [];
   console.log(`Debe ${fresh ? '(yeni liste)' : trDate(work.day)}: ${work.ids.length} entry, eksik ${missing.length}${retry ? '' : ' (yeniden deneme süresi doldu)'}; bu çalışmada ${queue.length} entry çekilecek.`);
@@ -295,7 +327,7 @@ async function updateDebe(previous, now, limit) {
     try {
       const { page, ms, remaining } = await fetchDetail(`/entry/${id}`);
       const entry = page.entries.find(e => e.id === id) ?? page.entries[0];
-      work.chunks.set(id, renderDebeEntry(page, entry, work.captions?.get(id)));
+      work.entries.set(id, debeEntry(page, entry, work.captions?.get(id)));
       if (entryDay(entry.date)) days.push(entryDay(entry.date));
       console.log(`${tag}: ${entry.author}, ${entry.date} (HTTP 200, ${seconds(ms)} sn, kalan istek hakkı ${remaining})`);
     } catch (error) {
@@ -307,39 +339,40 @@ async function updateDebe(previous, now, limit) {
   if (fresh) {
     const day = mostCommon(days);
     if (!day) {
-      console.log('Yeni debenin günü belirlenemedi (entry çekilemedi); öğe açılmadı.');
+      console.log('Yeni debenin günü belirlenemedi (entry çekilemedi); gün açılmadı.');
     } else {
       if (day !== yesterday) console.log(`Not: debe entry'lerinin tarihi ${trDate(day)}, İstanbul saatiyle dün ${trDate(yesterday)}; entry tarihi esas alındı.`);
       const existing = debes.find(debe => debe.day === day);
       if (existing) {
         console.log(`Debe ${trDate(day)} zaten vardı; liste güncellendi, çekilmiş entry'ler korundu.`);
         existing.ids = work.ids;
-        for (const [id, chunk] of work.chunks) existing.chunks.set(id, chunk);
+        for (const [id, entry] of work.entries) existing.entries.set(id, entry);
         work = existing;
       } else {
-        Object.assign(work, { day, guid: `${SITE}/debe#${day}` });
+        work.day = day;
         debes.push(work);
       }
     }
   }
-  if (work.day) console.log(`Debe ${trDate(work.day)}: ${work.ids.filter(id => work.chunks.has(id)).length}/${work.ids.length} entry hazır.`);
+  if (work.day) console.log(`Debe ${trDate(work.day)}: ${work.ids.filter(id => work.entries.has(id)).length}/${work.ids.length} entry hazır.`);
   return { debes, used, stop };
 }
 
-function render(items, now) {
+function render(channel, items, now) {
   const date = ms => new Date(ms).toUTCString();
   const lines = [
     '<?xml version="1.0" encoding="UTF-8"?>',
-    `<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:egr="${REPO}">`,
+    `<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:egr="${REPO}">`,
     '<channel>',
-    '<title>ekşi sözlük gündem</title>',
-    `<link>${SITE}/</link>`,
-    '<description>ekşi sözlük gündem başlıkları, en beğenilen entry\'leri ve günlük debe</description>',
+    `<title>${esc(channel.title)}</title>`,
+    `<link>${esc(channel.link)}</link>`,
+    `<description>${esc(channel.description)}</description>`,
     '<language>tr</language>',
     `<lastBuildDate>${date(now)}</lastBuildDate>`,
     '<ttl>30</ttl>',
     `<generator>${REPO}</generator>`,
-    ...(feedUrl ? [`<atom:link href="${esc(feedUrl)}" rel="self" type="application/rss+xml"/>`] : []),
+    ...(channel.self ? [`<atom:link href="${esc(channel.self)}" rel="self" type="application/rss+xml"/>`] : []),
+    ...channel.state ?? [],
   ];
   for (const item of items) {
     lines.push('<item>',
@@ -347,6 +380,8 @@ function render(items, now) {
       `<link>${esc(item.link)}</link>`,
       `<guid isPermaLink="false">${esc(item.guid)}</guid>`,
       `<pubDate>${date(item.firstSeen)}</pubDate>`,
+      ...(item.author ? [`<dc:creator>${esc(item.author)}</dc:creator>`] : []),
+      ...(item.category ? [`<category>${esc(item.category)}</category>`] : []),
       ...(item.description ? [`<description>${cdata(item.description)}</description>`] : []),
       ...item.state,
       '</item>');
@@ -364,18 +399,29 @@ const topicItem = t => ({
   ],
 });
 
-const debeItem = d => ({
-  title: `debe - ${trDate(d.day)}`, link: `${SITE}/debe`, guid: d.guid, firstSeen: d.firstSeen, description: debeHtml(d),
-  state: [`<egr:debeIds>${d.ids.join(' ')}</egr:debeIds>`],
+// Okuyucular öğeleri tarihe göre dizer: debe sırası korunsun diye her entry günün ilk çekilme anından sırası kadar saniye geridedir.
+const debeItems = d => d.ids.flatMap((id, i) => {
+  const e = d.entries.get(id);
+  return e ? [{ title: `${i + 1}. ${e.topic}`, link: e.link, guid: `${SITE}/entry/${id}`, firstSeen: d.firstSeen - i * 1000, author: e.author,
+    category: `debe ${trDate(d.day)}`, description: e.description, state: [`<egr:topic>${esc(e.topic)}</egr:topic>`] }] : [];
 });
+const debeState = d => `<egr:debe day="${d.day}" seen="${new Date(d.firstSeen).toISOString()}">${d.ids.join(' ')}</egr:debe>`;
+
+const GUNDEM_CHANNEL = { title: 'ekşi sözlük gündem', link: `${SITE}/`, description: 'ekşi sözlük gündem başlıkları ve en beğenilen entry\'leri', self: feedUrl };
+const DEBE_CHANNEL = { title: 'ekşi sözlük debe', link: `${SITE}/debe`, description: 'dünün en beğenilen entry\'leri (debe); her entry ayrı öğe', self: debeFeedUrl };
 
 const INDEX_HTML = `<!doctype html>
 <html lang="tr">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ekşi sözlük gündem RSS</title>
+<title>ekşi sözlük RSS</title>
 <link rel="alternate" type="application/rss+xml" title="ekşi sözlük gündem" href="feed.xml">
-<p>ekşi sözlük gündemi ve günlük debenin RSS beslemesi: <a href="feed.xml">feed.xml</a></p>
+<link rel="alternate" type="application/rss+xml" title="ekşi sözlük debe" href="debe.xml">
+<p>ekşi sözlük RSS beslemeleri:</p>
+<ul>
+<li><a href="feed.xml">gündem</a>: gündem başlıkları ve en beğenilen entry'leri</li>
+<li><a href="debe.xml">debe</a>: dünün en beğenilen entry'leri, her entry ayrı öğe</li>
+</ul>
 <p>Kaynak: <a href="${REPO}">${REPO.replace('https://', '')}</a></p>
 `;
 
@@ -392,48 +438,69 @@ async function main() {
       firstSeen: prev?.firstSeen ?? now - rank * 1000, lastSeen: now };
   });
   const fresh = current.filter(item => !prevById.has(item.id)).length;
-  console.log(`Gündem: ${topics.length} başlık (yeni ${fresh}, süren ${topics.length - fresh}); önceki beslemede ${previous.topics.length} gündem, ${previous.debes.length} debe öğesi.`);
+  console.log(`Gündem: ${topics.length} başlık (yeni ${fresh}, süren ${topics.length - fresh}); önceki beslemelerde ${previous.topics.length} gündem öğesi, ${previous.debes.length} debe günü.`);
 
-  // Bütçede öncelik debede; kalan gündem başlıklarına gider.
+  // Bütçede öncelik debede; kalan gündem sayfalarına gider.
   const debe = await updateDebe(previous.debes, now, budget);
-  const left = debe.stop ? 0 : budget - debe.used;
+  let left = debe.stop ? 0 : budget - debe.used;
 
   // Gündemde öncelik hiç çekilmemiş başlıklarda (gündem sırasıyla); sonra 6 saati geçmiş olanlar (en eskisi önce).
+  // Her sayfa bütçeden bir düşer; ikinci sayfa, sırada bekleyen hiç çekilmemiş başlıkların ilk sayfalarına bütçe kalıyorsa istenir.
   const never = current.filter(item => !item.fetchedAt);
   const stale = current.filter(item => item.fetchedAt && now - item.fetchedAt >= REFRESH_MS).sort((a, b) => a.fetchedAt - b.fetchedAt);
-  const queue = [...never, ...stale].slice(0, left);
-  console.log(`Gündem entry'leri: hiç çekilmemiş ${never.length}, yenilenecek ${stale.length}; bu çalışmada ${queue.length} başlık (kalan bütçe ${left}/${budget}).`);
+  const queue = [...never, ...stale];
+  console.log(`Gündem entry'leri: hiç çekilmemiş ${never.length}, yenilenecek ${stale.length}; kalan bütçe ${left}/${budget} sayfa.`);
 
-  let ok = 0, failed = 0;
+  let ok = 0, failed = 0, waitingNever = never.length, stop = false;
   for (const [i, item] of queue.entries()) {
-    const tag = `  [${i + 1}/${queue.length}] ${item.title}`;
+    if (stop || left <= 0) break;
+    if (!item.fetchedAt) waitingNever--;
+    left--;
+    const tag = `  [${i + 1}/${queue.length}] ${item.title}`, path = new URL(item.link).pathname;
     try {
-      const { page, ms, remaining } = await fetchDetail(new URL(item.link).pathname + '?a=nice');
-      if (page.id && page.id !== item.id) console.log(`${tag}: sayfa başka başlığa (${page.id}) yönlendi.`);
-      if (page.title) item.title = page.title;
-      item.entriesHtml = page.entries.map(renderEntry).join('\n');
+      const first = await fetchDetail(`${path}?a=nice`);
+      let { page: { entries } } = first, { ms, remaining } = first, pages = 1, note = '';
+      if (first.page.pages > 1 && entries.length < ENTRIES_PER_TOPIC && left > waitingNever) {
+        left--;
+        try {
+          const second = await fetchDetail(`${path}?a=nice&p=2`), seen = new Set(entries.map(e => e.id));
+          entries = [...entries, ...second.page.entries.filter(e => !seen.has(e.id))];
+          ms += second.ms; remaining = second.remaining; pages = 2;
+        } catch (error) {
+          note = `; 2. sayfa alınamadı (${error.message})`;
+          stop = !!error.stop;
+        }
+      }
+      if (first.page.id && first.page.id !== item.id) console.log(`${tag}: sayfa başka başlığa (${first.page.id}) yönlendi.`);
+      if (first.page.title) item.title = first.page.title;
+      entries = entries.slice(0, ENTRIES_PER_TOPIC);
+      item.entriesHtml = entries.map(renderEntry).join('\n');
       item.fetchedAt = Date.now();
       ok++;
-      console.log(`${tag}: ${page.entries.length} entry (HTTP 200, ${seconds(ms)} sn, kalan istek hakkı ${remaining})`);
+      console.log(`${tag}: ${entries.length} entry, ${pages} sayfa (HTTP 200, ${seconds(ms)} sn, kalan istek hakkı ${remaining})${note}`);
     } catch (error) {
       failed++;
       console.log(`${tag}: atlandı, sonraki çalışmaya kaldı (${error.message})`);
-      if (error.stop) break;
+      stop = !!error.stop;
     }
   }
 
   const currentIds = new Set(current.map(item => item.id));
   const dropped = previous.topics.filter(item => !currentIds.has(item.id) && now - item.lastSeen <= KEEP_MS).sort((a, b) => b.lastSeen - a.lastSeen);
   const kept = [...current, ...dropped].slice(0, MAX_ITEMS);
-  const items = [...kept.map(topicItem), ...debe.debes.map(debeItem)].sort((a, b) => b.firstSeen - a.firstSeen);
+  const topicItems = kept.map(topicItem).sort((a, b) => b.firstSeen - a.firstSeen);
+  const days = debe.debes.sort((a, b) => b.day.localeCompare(a.day));
+  const debeEntries = days.flatMap(debeItems).sort((a, b) => b.firstSeen - a.firstSeen);
   const waiting = current.filter(item => !item.fetchedAt).length;
   console.log(`Sonuç: ${ok} başlığın entry'leri çekildi, ${failed} düştü; entry'si henüz olmayan ${waiting} başlık sonraki çalışmalara kaldı.`);
-  console.log(`Besleme: ${items.length} öğe (gündemde ${current.length}, gündemden düşüp tutulan ${kept.length - current.length}, debe ${debe.debes.length}).`);
+  console.log(`Gündem beslemesi: ${topicItems.length} öğe (gündemde ${current.length}, gündemden düşüp tutulan ${kept.length - current.length}).`);
+  console.log(`Debe beslemesi: ${days.length} gün, ${debeEntries.length} entry.`);
 
   await mkdir(outDir, { recursive: true });
-  await writeFile(join(outDir, 'feed.xml'), render(items, now));
+  await writeFile(join(outDir, 'feed.xml'), render(GUNDEM_CHANNEL, topicItems, now));
+  await writeFile(join(outDir, 'debe.xml'), render({ ...DEBE_CHANNEL, state: days.map(debeState) }, debeEntries, now));
   await writeFile(join(outDir, 'index.html'), INDEX_HTML);
-  console.log(`Yazıldı: ${join(outDir, 'feed.xml')}`);
+  console.log(`Yazıldı: ${join(outDir, 'feed.xml')}, ${join(outDir, 'debe.xml')}`);
 }
 
 main().catch(error => { console.error(`HATA: ${error.message}`); process.exit(1); });
