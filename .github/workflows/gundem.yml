@@ -1,0 +1,60 @@
+name: ekşi gündem RSS
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # besleme
+    - cron: '17 3 * * *'     # günlük canlı tutma (60 gün etkinliksizlikte zamanlanmış iş kapanmasın)
+  workflow_dispatch:
+
+concurrency:
+  group: eksi-gundem
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event.schedule != '17 3 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - id: pages
+        uses: actions/configure-pages@v6
+      - name: Beslemeyi üret
+        run: node gundem.mjs
+        env:
+          FEED_URL: ${{ steps.pages.outputs.base_url }}/feed.xml
+          OUT_DIR: public
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  keepalive:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Workflow'u etkin tut
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/gundem.yml/enable" && echo "Workflow etkin."
+        env:
+          GH_TOKEN: ${{ github.token }}
