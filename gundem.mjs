@@ -19,7 +19,8 @@ const USER_AGENT = `eksi-gundem-rss/1.0 (+${REPO})`;
 const TIMEOUT_MS = 45_000;
 const GAP_MS = 3_500;                       // Jina istekleri arasındaki en kısa ara (anahtarsız sınır dakikada 20 istek)
 const HOUR = 60 * 60 * 1000, DAY = 24 * HOUR;
-const ENTRIES_PER_TOPIC = 20;               // gündem başlığı başına en beğenilen entry; Ekşi sayfada 10 gösterdiği için iki sayfa
+const ENTRIES_PER_TOPIC = 20;               // gündem başlığı başına bugünün en beğenilen entry'leri (şükela: bugün); Ekşi sayfada 10 gösterdiği için iki sayfa
+const TODAY = '?a=dailynice';               // başlığın bugün yazılmış entry'leri, beğeniye göre
 const REFRESH_MS = 6 * HOUR;                // gündemde kalan başlığın entry'leri en çok bu sıklıkla yenilenir
 const KEEP_MS = 3 * DAY;                    // gündemden düşen başlık son görülmesinden sonra bu kadar süre beslemede kalır
 const MAX_ITEMS = 150;                      // gündem öğesi sınırı
@@ -131,7 +132,7 @@ function parseTopics(html) {
     if (!title) continue;
     seen.add(m[2]);
     const count = text(/<small\b[^>]*>([\s\S]*?)<\/small>/i.exec(content)?.[1] ?? '');
-    topics.push({ id: m[2], title, count, guid: `${SITE}/${m[1]}--${m[2]}`, link: `${SITE}/${m[1]}--${m[2]}?a=nice` });
+    topics.push({ id: m[2], title, count, guid: `${SITE}/${m[1]}--${m[2]}`, link: `${SITE}/${m[1]}--${m[2]}${TODAY}` });
   }
   if (!topics.length) throw new Error('topic-list içinde başlık bulunamadı');
   return topics;
@@ -407,7 +408,7 @@ const debeItems = d => d.ids.flatMap((id, i) => {
 });
 const debeState = d => `<egr:debe day="${d.day}" seen="${new Date(d.firstSeen).toISOString()}">${d.ids.join(' ')}</egr:debe>`;
 
-const GUNDEM_CHANNEL = { title: 'ekşi sözlük gündem', link: `${SITE}/`, description: 'ekşi sözlük gündem başlıkları ve en beğenilen entry\'leri', self: feedUrl };
+const GUNDEM_CHANNEL = { title: 'ekşi sözlük gündem', link: `${SITE}/`, description: 'ekşi sözlük gündem başlıkları ve bugünün en beğenilen entry\'leri', self: feedUrl };
 const DEBE_CHANNEL = { title: 'ekşi sözlük debe', link: `${SITE}/debe`, description: 'dünün en beğenilen entry\'leri (debe); her entry ayrı öğe', self: debeFeedUrl };
 
 const INDEX_HTML = `<!doctype html>
@@ -419,7 +420,7 @@ const INDEX_HTML = `<!doctype html>
 <link rel="alternate" type="application/rss+xml" title="ekşi sözlük debe" href="debe.xml">
 <p>ekşi sözlük RSS beslemeleri:</p>
 <ul>
-<li><a href="feed.xml">gündem</a>: gündem başlıkları ve en beğenilen entry'leri</li>
+<li><a href="feed.xml">gündem</a>: gündem başlıkları ve bugünün en beğenilen entry'leri</li>
 <li><a href="debe.xml">debe</a>: dünün en beğenilen entry'leri, her entry ayrı öğe</li>
 </ul>
 <p>Kaynak: <a href="${REPO}">${REPO.replace('https://', '')}</a></p>
@@ -444,10 +445,11 @@ async function main() {
   const debe = await updateDebe(previous.debes, now, budget);
   let left = debe.stop ? 0 : budget - debe.used;
 
-  // Gündemde öncelik hiç çekilmemiş başlıklarda (gündem sırasıyla); sonra 6 saati geçmiş olanlar (en eskisi önce).
+  // Gündemde öncelik hiç çekilmemiş başlıklarda (gündem sırasıyla); sonra 6 saati geçmiş ya da dünden kalmış olanlar (en eskisi önce).
   // Her sayfa bütçeden bir düşer; ikinci sayfa, sırada bekleyen hiç çekilmemiş başlıkların ilk sayfalarına bütçe kalıyorsa istenir.
+  const today = istanbulDay(now), fromToday = item => istanbulDay(item.fetchedAt) === today;
   const never = current.filter(item => !item.fetchedAt);
-  const stale = current.filter(item => item.fetchedAt && now - item.fetchedAt >= REFRESH_MS).sort((a, b) => a.fetchedAt - b.fetchedAt);
+  const stale = current.filter(item => item.fetchedAt && (now - item.fetchedAt >= REFRESH_MS || !fromToday(item))).sort((a, b) => a.fetchedAt - b.fetchedAt);
   const queue = [...never, ...stale];
   console.log(`Gündem entry'leri: hiç çekilmemiş ${never.length}, yenilenecek ${stale.length}; kalan bütçe ${left}/${budget} sayfa.`);
 
@@ -458,12 +460,12 @@ async function main() {
     left--;
     const tag = `  [${i + 1}/${queue.length}] ${item.title}`, path = new URL(item.link).pathname;
     try {
-      const first = await fetchDetail(`${path}?a=nice`);
+      const first = await fetchDetail(path + TODAY);
       let { page: { entries } } = first, { ms, remaining } = first, pages = 1, note = '';
       if (first.page.pages > 1 && entries.length < ENTRIES_PER_TOPIC && left > waitingNever) {
         left--;
         try {
-          const second = await fetchDetail(`${path}?a=nice&p=2`), seen = new Set(entries.map(e => e.id));
+          const second = await fetchDetail(`${path}${TODAY}&p=2`), seen = new Set(entries.map(e => e.id));
           entries = [...entries, ...second.page.entries.filter(e => !seen.has(e.id))];
           ms += second.ms; remaining = second.remaining; pages = 2;
         } catch (error) {
@@ -473,6 +475,10 @@ async function main() {
       }
       if (first.page.id && first.page.id !== item.id) console.log(`${tag}: sayfa başka başlığa (${first.page.id}) yönlendi.`);
       if (first.page.title) item.title = first.page.title;
+      // Yalnız bugünün entry'leri: tarihi okunamayan entry atılmaz (sayfa yapısı değişirse içerik boşalmasın).
+      const all = entries.length;
+      entries = entries.filter(e => (entryDay(e.date) ?? today) === today);
+      if (entries.length < all) note += `; bugünden olmayan ${all - entries.length} entry atıldı`;
       entries = entries.slice(0, ENTRIES_PER_TOPIC);
       item.entriesHtml = entries.map(renderEntry).join('\n');
       item.fetchedAt = Date.now();
@@ -480,6 +486,8 @@ async function main() {
       console.log(`${tag}: ${entries.length} entry, ${pages} sayfa (HTTP 200, ${seconds(ms)} sn, kalan istek hakkı ${remaining})${note}`);
     } catch (error) {
       failed++;
+      // Dünden kalan entry'ler gösterilmez; başlık bugün çekilene dek yalnız sayıyla yayımlanır.
+      if (!fromToday(item)) item.entriesHtml = '';
       console.log(`${tag}: atlandı, sonraki çalışmaya kaldı (${error.message})`);
       stop = !!error.stop;
     }
