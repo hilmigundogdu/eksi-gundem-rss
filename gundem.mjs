@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // Ekşi Sözlük gündemini (feed.xml) ve günlük debeyi (debe.xml, her entry ayrı öğe) RSS 2.0 beslemelerine çevirir. Bağımlılık yok (Node 18+).
 // Ekşi'ye doğrudan istek atılmaz: Cloudflare düz isteği challenge'a düşürdüğü için sayfalar Jina Reader (r.jina.ai) üzerinden okunur.
+// Anahtarsız Jina isteği de challenge'a düşerse çalışmanın kalanı JINA_API_KEY ile Jina'nın tarayıcı motorundan gider.
 //
 // Ortam:  FEED_URL  yayımlanmış gündem beslemesinin adresi; debe beslemesi yanındaki debe.xml'dir. İlk görülme tarihleri
 //                   ve çekilmiş entry'ler bu iki beslemeden taşınır.
 //         OUT_DIR   çıktı klasörü (varsayılan: public).
+//         JINA_API_KEY  yalnız anahtarsız istek challenge'a düşünce kullanılır; yoksa o çalışma yayın yapmaz.
 // Yerel deneme:  node gundem.mjs [--prev eski-feed.xml] [--prev-debe eski-debe.xml] [--out klasor] [--budget 3]
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -17,10 +19,11 @@ const JINA = 'https://r.jina.ai/';
 const REPO = 'https://github.com/hilmigundogdu/eksi-gundem-rss';
 const USER_AGENT = `eksi-gundem-rss/1.0 (+${REPO})`;
 const TIMEOUT_MS = 45_000;
+const KEYED_TIMEOUT_MS = 90_000;            // tarayıcı motoru sayfanın öğesini en çok 40 sn bekler (X-Timeout)
 const GAP_MS = 3_500;                       // Jina istekleri arasındaki en kısa ara (anahtarsız sınır dakikada 20 istek)
 const HOUR = 60 * 60 * 1000, DAY = 24 * HOUR;
-const ENTRIES_PER_TOPIC = 20;               // gündem başlığı başına bugünün en beğenilen entry'leri (şükela: bugün); Ekşi sayfada 10 gösterdiği için iki sayfa
-const TODAY = '?a=dailynice';               // başlığın bugün yazılmış entry'leri, beğeniye göre
+const ENTRIES_PER_TOPIC = 20;               // gündem başlığı başına son 24 saatin en beğenilen entry'leri; Ekşi sayfada 10 gösterdiği için iki sayfa
+const TODAY = '?a=dailynice';               // Ekşi'nin “şükela: bugün” süzgeci; gece yarısı sıfırlanmaz, son 24 saati gösterir
 const REFRESH_MS = 6 * HOUR;                // gündemde kalan başlığın entry'leri en çok bu sıklıkla yenilenir
 const KEEP_MS = 3 * DAY;                    // gündemden düşen başlık son görülmesinden sonra bu kadar süre beslemede kalır
 const MAX_ITEMS = 150;                      // gündem öğesi sınırı
@@ -59,6 +62,8 @@ const seconds = ms => (ms / 1000).toFixed(1).replace('.', ',');
 const istanbulDay = ms => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Istanbul', year: 'numeric', month: '2-digit', day: '2-digit' }).format(ms);
 const previousDay = day => new Date(Date.parse(`${day}T00:00:00Z`) - DAY).toISOString().slice(0, 10);
 const trDate = day => day.split('-').reverse().join('.');
+// Entry'nin yazılış anı ("25.10.2026 19:22 ~ 26.10.2026 00:14" düzenlenmişse ilk tarih); İstanbul yaz saatsiz UTC+3'tür.
+const entryTime = date => { const m = /^(\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2})/.exec(date); return m ? Date.UTC(+m[3], m[2] - 1, +m[1], m[4] - 3, +m[5]) : null; };
 const entryDay = date => { const m = /^(\d{2})\.(\d{2})\.(\d{4})/.exec(date); return m ? `${m[3]}-${m[2]}-${m[1]}` : null; };
 const mostCommon = list => [...list.reduce((map, x) => map.set(x, (map.get(x) ?? 0) + 1), new Map())].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
 
@@ -81,27 +86,47 @@ function isChallenge(res, body) {
   return /_cf_chl_opt|<title>\s*(Just a moment|Attention Required|Bir dakika)/i.test(body);
 }
 
-// Jina istekleri sırayla gider; bir istek bittikten sonra bir sonraki en az GAP_MS bekler.
+// Anahtarla istenen sayfa parçası: tarayıcı motoru challenge'ı çözer, wait gelene dek bekler ve yalnız target'ı döndürür. Jina token'ı döndürülen
+// içerik kadar düşer (gündem listesi ~4 bin, başlık sayfası ~16 bin); tam sayfa, hele challenge sayfası (~310 bin), kotayı hızla bitirir.
+const LIST = { wait: 'ul.topic-list', target: 'ul.topic-list' };
+const PAGE = { wait: '#entry-item-list', target: 'h1#title, #entry-item-list, div.pager' };
+const JINA_KEY = process.env.JINA_API_KEY || '';
+const jina = { keyed: false, requests: 0, tokens: 0 };
+
+// Jina istekleri sırayla gider; anahtarsız istek bir öncekinin bitişinden en az GAP_MS sonra gider (anahtarla sınır dakikada 500).
 let lastDone = 0;
-async function viaJina(path) {
-  const wait = lastDone + GAP_MS - Date.now();
+async function request(path, view) {
+  const keyed = jina.keyed, wait = keyed ? 0 : lastDone + GAP_MS - Date.now();
   if (wait > 0) await sleep(wait);
   const started = Date.now();
   try {
-    const res = await fetch(JINA + SITE + path, {
-      // X-No-Cache: Jina'nın önbelleği sayfayı yarım saatten eski gösterebiliyor.
-      headers: { 'X-Return-Format': 'html', 'X-No-Cache': 'true', 'User-Agent': USER_AGENT },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-    const body = await res.text();
+    // X-No-Cache: Jina'nın önbelleği sayfayı yarım saatten eski gösterebiliyor.
+    const headers = { 'X-Return-Format': 'html', 'X-No-Cache': 'true', 'User-Agent': USER_AGENT };
+    if (keyed) Object.assign(headers, { Authorization: `Bearer ${JINA_KEY}`, Accept: 'application/json', 'X-Engine': 'browser',
+      'X-Wait-For-Selector': view.wait, 'X-Target-Selector': view.target, 'X-Timeout': '40' });
+    const res = await fetch(JINA + SITE + path, { headers, signal: AbortSignal.timeout(keyed ? KEYED_TIMEOUT_MS : TIMEOUT_MS) });
+    let body = await res.text();
+    if (keyed) {
+      jina.requests++;
+      try { const { data } = JSON.parse(body); body = data?.html ?? body; jina.tokens += Number(data?.usage?.tokens) || 0; } catch { /* hata gövdesi JSON değil */ }
+    }
     return { status: res.status, body, ms: Date.now() - started, challenge: isChallenge(res, body), remaining: res.headers.get('x-ratelimit-remaining') ?? '-' };
   } finally {
     lastDone = Date.now();
   }
 }
 
+// Anahtarsız istek challenge'a düşünce aynı istek anahtarla yinelenir ve çalışmanın kalanı anahtarla gider.
+async function viaJina(path, view) {
+  const r = await request(path, view);
+  if (!r.challenge || jina.keyed || !JINA_KEY) return r;
+  jina.keyed = true;
+  console.log('Anahtarsız Jina isteği Cloudflare challenge\'ına düştü; bu çalışmanın kalanı Jina anahtarı ve tarayıcı motoruyla gider.');
+  return request(path, view);
+}
+
 async function fetchList(path, label) {
-  const r = await viaJina(path);
+  const r = await viaJina(path, LIST);
   console.log(`Jina ${label}: HTTP ${r.status}, ${Buffer.byteLength(r.body)} bayt, ${seconds(r.ms)} sn, kalan istek hakkı ${r.remaining}`);
   if (r.status !== 200) throw new Error(`Jina ${label} için HTTP ${r.status} döndü (${text(r.body).slice(0, 200)})`);
   if (r.challenge) throw new Error(`Jina üzerinden ${label} için Cloudflare challenge sayfası geldi`);
@@ -110,8 +135,9 @@ async function fetchList(path, label) {
 
 // Başlık ya da entry sayfası; 429'da çağıran o çalışmadaki öteki ayrıntı sayfalarını bırakır.
 async function fetchDetail(path) {
-  const r = await viaJina(path);
+  const r = await viaJina(path, PAGE);
   if (r.status === 429) throw Object.assign(new Error('HTTP 429, Jina sınırı doldu'), { stop: true });
+  if (r.status === 402) throw Object.assign(new Error('HTTP 402, Jina anahtarının token kotası bitti'), { stop: true });
   if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
   if (r.challenge) throw new Error('Cloudflare challenge sayfası');
   return { page: parsePage(r.body), ms: r.ms, remaining: r.remaining };
@@ -408,7 +434,7 @@ const debeItems = d => d.ids.flatMap((id, i) => {
 });
 const debeState = d => `<egr:debe day="${d.day}" seen="${new Date(d.firstSeen).toISOString()}">${d.ids.join(' ')}</egr:debe>`;
 
-const GUNDEM_CHANNEL = { title: 'ekşi sözlük gündem', link: `${SITE}/`, description: 'ekşi sözlük gündem başlıkları ve bugünün en beğenilen entry\'leri', self: feedUrl };
+const GUNDEM_CHANNEL = { title: 'ekşi sözlük gündem', link: `${SITE}/`, description: 'ekşi sözlük gündem başlıkları ve son 24 saatin en beğenilen entry\'leri', self: feedUrl };
 const DEBE_CHANNEL = { title: 'ekşi sözlük debe', link: `${SITE}/debe`, description: 'dünün en beğenilen entry\'leri (debe); her entry ayrı öğe', self: debeFeedUrl };
 
 const INDEX_HTML = `<!doctype html>
@@ -420,7 +446,7 @@ const INDEX_HTML = `<!doctype html>
 <link rel="alternate" type="application/rss+xml" title="ekşi sözlük debe" href="debe.xml">
 <p>ekşi sözlük RSS beslemeleri:</p>
 <ul>
-<li><a href="feed.xml">gündem</a>: gündem başlıkları ve bugünün en beğenilen entry'leri</li>
+<li><a href="feed.xml">gündem</a>: gündem başlıkları ve son 24 saatin en beğenilen entry'leri</li>
 <li><a href="debe.xml">debe</a>: dünün en beğenilen entry'leri, her entry ayrı öğe</li>
 </ul>
 <p>Kaynak: <a href="${REPO}">${REPO.replace('https://', '')}</a></p>
@@ -445,11 +471,10 @@ async function main() {
   const debe = await updateDebe(previous.debes, now, budget);
   let left = debe.stop ? 0 : budget - debe.used;
 
-  // Gündemde öncelik hiç çekilmemiş başlıklarda (gündem sırasıyla); sonra 6 saati geçmiş ya da dünden kalmış olanlar (en eskisi önce).
+  // Gündemde öncelik hiç çekilmemiş başlıklarda (gündem sırasıyla); sonra 6 saati geçmiş olanlar (en eskisi önce).
   // Her sayfa bütçeden bir düşer; ikinci sayfa, sırada bekleyen hiç çekilmemiş başlıkların ilk sayfalarına bütçe kalıyorsa istenir.
-  const today = istanbulDay(now), fromToday = item => istanbulDay(item.fetchedAt) === today;
   const never = current.filter(item => !item.fetchedAt);
-  const stale = current.filter(item => item.fetchedAt && (now - item.fetchedAt >= REFRESH_MS || !fromToday(item))).sort((a, b) => a.fetchedAt - b.fetchedAt);
+  const stale = current.filter(item => item.fetchedAt && now - item.fetchedAt >= REFRESH_MS).sort((a, b) => a.fetchedAt - b.fetchedAt);
   const queue = [...never, ...stale];
   console.log(`Gündem entry'leri: hiç çekilmemiş ${never.length}, yenilenecek ${stale.length}; kalan bütçe ${left}/${budget} sayfa.`);
 
@@ -475,10 +500,10 @@ async function main() {
       }
       if (first.page.id && first.page.id !== item.id) console.log(`${tag}: sayfa başka başlığa (${first.page.id}) yönlendi.`);
       if (first.page.title) item.title = first.page.title;
-      // Yalnız bugünün entry'leri: tarihi okunamayan entry atılmaz (sayfa yapısı değişirse içerik boşalmasın).
+      // Yalnız son 24 saatte yazılmış entry'ler: tarihi okunamayan entry atılmaz (sayfa yapısı değişirse içerik boşalmasın).
       const all = entries.length;
-      entries = entries.filter(e => (entryDay(e.date) ?? today) === today);
-      if (entries.length < all) note += `; bugünden olmayan ${all - entries.length} entry atıldı`;
+      entries = entries.filter(e => (entryTime(e.date) ?? now) > now - DAY);
+      if (entries.length < all) note += `; 24 saatten eski ${all - entries.length} entry atıldı`;
       entries = entries.slice(0, ENTRIES_PER_TOPIC);
       item.entriesHtml = entries.map(renderEntry).join('\n');
       item.fetchedAt = Date.now();
@@ -486,8 +511,8 @@ async function main() {
       console.log(`${tag}: ${entries.length} entry, ${pages} sayfa (HTTP 200, ${seconds(ms)} sn, kalan istek hakkı ${remaining})${note}`);
     } catch (error) {
       failed++;
-      // Dünden kalan entry'ler gösterilmez; başlık bugün çekilene dek yalnız sayıyla yayımlanır.
-      if (!fromToday(item)) item.entriesHtml = '';
+      // 24 saatten önce çekilmiş entry'ler gösterilmez; başlık yeniden çekilene dek yalnız sayıyla yayımlanır.
+      if (now - item.fetchedAt >= DAY) item.entriesHtml = '';
       console.log(`${tag}: atlandı, sonraki çalışmaya kaldı (${error.message})`);
       stop = !!error.stop;
     }
@@ -503,6 +528,7 @@ async function main() {
   console.log(`Sonuç: ${ok} başlığın entry'leri çekildi, ${failed} düştü; entry'si henüz olmayan ${waiting} başlık sonraki çalışmalara kaldı.`);
   console.log(`Gündem beslemesi: ${topicItems.length} öğe (gündemde ${current.length}, gündemden düşüp tutulan ${kept.length - current.length}).`);
   console.log(`Debe beslemesi: ${days.length} gün, ${debeEntries.length} entry.`);
+  if (jina.keyed) console.log(`Jina anahtarı: ${jina.requests} istek, ${jina.tokens.toLocaleString('tr-TR')} token.`);
 
   await mkdir(outDir, { recursive: true });
   await writeFile(join(outDir, 'feed.xml'), render(GUNDEM_CHANNEL, topicItems, now));
