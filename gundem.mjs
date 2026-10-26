@@ -1,17 +1,23 @@
 #!/usr/bin/env node
-// Ekşi Sözlük gündemini (feed.xml) ve günlük debeyi (debe.xml, her entry ayrı öğe) RSS 2.0 beslemelerine çevirir. Bağımlılık yok (Node 18+).
-// Ekşi'ye doğrudan istek atılmaz: Cloudflare düz isteği challenge'a düşürdüğü için sayfalar Jina Reader (r.jina.ai) üzerinden okunur.
-// Anahtarsız Jina isteği de challenge'a düşerse çalışmanın kalanı JINA_API_KEY ile Jina'nın tarayıcı motorundan gider.
+// Ekşi Sözlük gündemini (feed.xml) ve günlük debeyi (debe.xml, her entry ayrı öğe) RSS 2.0 beslemelerine çevirir (Node 18+).
+// Ana kaynak Ekşi'nin mobil API'sidir: eksi_api.py köprüsü (Python, requirements.txt) alt süreç olarak açılır.
+// Köprü açılamaz ya da gündem listesi gelmezse çalışmanın tamamı Jina Reader (r.jina.ai) üzerinden web sayfalarından gider;
+// Cloudflare düz isteği challenge'a düşürdüğü için Ekşi'nin sayfalarına doğrudan istek atılmaz. Anahtarsız Jina isteği de
+// challenge'a düşerse çalışmanın kalanı JINA_API_KEY ile Jina'nın tarayıcı motorundan gider.
 //
 // Ortam:  FEED_URL  yayımlanmış gündem beslemesinin adresi; debe beslemesi yanındaki debe.xml'dir. İlk görülme tarihleri
 //                   ve çekilmiş entry'ler bu iki beslemeden taşınır.
 //         OUT_DIR   çıktı klasörü (varsayılan: public).
-//         JINA_API_KEY  yalnız anahtarsız istek challenge'a düşünce kullanılır; yoksa o çalışma yayın yapmaz.
-// Yerel deneme:  node gundem.mjs [--prev eski-feed.xml] [--prev-debe eski-debe.xml] [--out klasor] [--budget 3]
+//         EKSI_PYTHON   köprüyü çalıştıracak Python (varsayılan: python3).
+//         JINA_API_KEY  yalnız Jina yolunda, anahtarsız istek challenge'a düşünce kullanılır; yoksa o çalışma yayın yapmaz.
+// Yerel deneme:  node gundem.mjs [--prev eski-feed.xml] [--prev-debe eski-debe.xml] [--out klasor] [--budget 3] [--source api|jina]
 
+import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const SITE = 'https://eksisozluk.com';
@@ -21,23 +27,25 @@ const USER_AGENT = `eksi-gundem-rss/1.0 (+${REPO})`;
 const TIMEOUT_MS = 45_000;
 const KEYED_TIMEOUT_MS = 90_000;            // tarayıcı motoru sayfanın öğesini en çok 40 sn bekler (X-Timeout)
 const GAP_MS = 3_500;                       // Jina istekleri arasındaki en kısa ara (anahtarsız sınır dakikada 20 istek)
+const API_GAP_MS = 250;                     // mobil API istekleri arasındaki en kısa ara
+const API_TIMEOUT_MS = 100_000;             // köprünün tek yanıtı (HTTP isteği 30 sn; token yenilenirse üç istek)
 const HOUR = 60 * 60 * 1000, DAY = 24 * HOUR;
 const ENTRIES_PER_TOPIC = 20;               // gündem başlığı başına son 24 saatin en beğenilen entry'leri; Ekşi sayfada 10 gösterdiği için iki sayfa
 const TODAY = '?a=dailynice';               // Ekşi'nin “şükela: bugün” süzgeci; gece yarısı sıfırlanmaz, son 24 saati gösterir
-const REFRESH_MS = 6 * HOUR;                // gündemde kalan başlığın entry'leri en çok bu sıklıkla yenilenir
+const REFRESH_MS = 6 * HOUR;                // Jina yolunda gündemde kalan başlığın entry'leri en çok bu sıklıkla yenilenir
+const API_REFRESH_MS = HOUR;                // mobil API yolunda aynısı
 const KEEP_MS = 3 * DAY;                    // gündemden düşen başlık son görülmesinden sonra bu kadar süre beslemede kalır
 const MAX_ITEMS = 150;                      // gündem öğesi sınırı
 const DEBE_KEEP_MS = 14 * DAY;              // debe günü ilk çekilmesinden sonra bu kadar süre beslemede kalır
 const DEBE_RETRY_MS = DAY;                  // debede düşen entry bu süre boyunca yeniden denenir; silinmiş entry sonsuza dek istek yemez
 
 const { values: args } = parseArgs({ options: {
-  prev: { type: 'string' }, 'prev-debe': { type: 'string' }, out: { type: 'string' }, budget: { type: 'string' },
+  prev: { type: 'string' }, 'prev-debe': { type: 'string' }, out: { type: 'string' }, budget: { type: 'string' }, source: { type: 'string' },
 } });
 const feedUrl = process.env.FEED_URL || '';
 const debeFeedUrl = feedUrl && new URL('debe.xml', feedUrl).href;
 const outDir = args.out || process.env.OUT_DIR || 'public';
-// Bir çalışmada çekilecek en çok ayrıntı sayfası (debe entry'leri + gündem sayfaları); ana sayfa ve debe listesi buna girmez.
-const budget = Math.max(0, Number(args.budget ?? 60) || 0);
+if (args.source && !['api', 'jina'].includes(args.source)) { console.error(`HATA: --source api ya da jina olmalı (${args.source})`); process.exit(2); }
 
 const ENTITIES = new Map(Object.entries({
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', hellip: '…', ndash: '–', mdash: '—',
@@ -140,7 +148,146 @@ async function fetchDetail(path) {
   if (r.status === 402) throw Object.assign(new Error('HTTP 402, Jina anahtarının token kotası bitti'), { stop: true });
   if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
   if (r.challenge) throw new Error('Cloudflare challenge sayfası');
-  return { page: parsePage(r.body), ms: r.ms, remaining: r.remaining };
+  return { page: parsePage(r.body), ms: r.ms, info: `kalan istek hakkı ${r.remaining}` };
+}
+
+// Mobil API köprüsü: eksi_api.py ile satır başına bir JSON istek/yanıt alışverişi. İstekler sırayla, aralarında API_GAP_MS ile gider.
+let bridge = null, lastApi = 0, apiRequests = 0;
+function openBridge() {
+  const child = spawn(process.env.EKSI_PYTHON || 'python3', [fileURLToPath(new URL('eksi_api.py', import.meta.url))], { stdio: 'pipe' });
+  const pending = new Map();
+  let seq = 0, stderr = '', closed = null;
+  const fail = reason => {
+    closed ??= reason;
+    for (const { reject } of pending.values()) reject(new Error(closed));
+    pending.clear();
+  };
+  child.on('error', error => fail(`köprü açılamadı: ${error.message}`));
+  child.on('close', code => fail(`köprü kapandı (çıkış ${code})${stderr.trim() ? `: ${stderr.trim().split('\n').at(-1)}` : ''}`));
+  child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-2000); });
+  child.stdin.on('error', () => {});   // köprü düştüyse nedeni close olayında raporlanır
+  createInterface({ input: child.stdout }).on('line', line => {
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }
+    pending.get(msg.id)?.resolve(msg);
+    pending.delete(msg.id);
+  });
+  return {
+    call: path => new Promise((resolve, reject) => {
+      if (closed) return reject(new Error(closed));
+      const id = ++seq, timer = setTimeout(() => { pending.delete(id); reject(new Error('köprü yanıt vermedi')); }, API_TIMEOUT_MS);
+      pending.set(id, { resolve: msg => { clearTimeout(timer); resolve(msg); }, reject: error => { clearTimeout(timer); reject(error); } });
+      child.stdin.write(`${JSON.stringify({ id, path })}\n`);
+    }),
+    close: () => child.stdin.end(),
+  };
+}
+
+async function apiGet(path) {
+  const wait = lastApi + API_GAP_MS - Date.now();
+  if (wait > 0) await sleep(wait);
+  const started = Date.now();
+  apiRequests++;
+  try {
+    const { error, status, json } = await bridge.call(path);
+    if (error) throw new Error(error);
+    const message = json?.Message ? ` (${json.Message})` : '';
+    if (status === 429) throw Object.assign(new Error(`HTTP 429, API sınırı doldu${message}`), { stop: true });
+    if (status !== 200) throw new Error(`HTTP ${status}${message}`);
+    if (!json || json.Success === false) throw new Error(`API başarısız yanıt döndü${message}`);
+    return { data: json.Data, ms: Date.now() - started };
+  } finally {
+    lastApi = Date.now();
+  }
+}
+
+// Ekşi'nin başlık adresindeki slug: küçük harf, kesme düşer, Türkçe harfler sadeleşir, kalan her şey tire olur.
+const slugify = title => title.toLocaleLowerCase('tr').replace(/['’]/g, '').replace(/ı/g, 'i').normalize('NFKD')
+  .replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+
+// API'nin gündem listesinde slug yok; adres başlıktan üretilir, başlık çekilince API'nin verdiği slug'la düzelir.
+function apiTopics(data) {
+  const topics = [], seen = new Set();
+  for (const t of data?.Topics ?? []) {
+    const id = String(t.TopicId ?? ''), title = String(t.Title ?? '').trim();
+    if (!/^\d+$/.test(id) || !title || seen.has(id)) continue;
+    seen.add(id);
+    const url = `${SITE}/${slugify(title)}--${id}`;
+    topics.push({ id, title, count: t.MatchedCount ? String(t.MatchedCount) : '', guid: url, link: url + TODAY });
+  }
+  if (!topics.length) throw new Error('gündem listesi boş');
+  return topics;
+}
+
+function apiDebeList(data) {
+  const ids = [], captions = new Map();
+  for (const { EntryId, Title } of data?.DebeItems ?? []) {
+    const id = String(EntryId ?? '');
+    if (!/^\d+$/.test(id) || captions.has(id)) continue;
+    ids.push(id);
+    captions.set(id, String(Title ?? '').trim());
+  }
+  if (!ids.length) throw new Error('debe listesinde entry bulunamadı');
+  return { ids, captions };
+}
+
+// API tarihleri İstanbul saatiyle, saat dilimsiz gelir ("2026-10-25T19:07:42.82"); web sayfasındaki biçime çevrilir.
+function apiDate(created, updated) {
+  const parts = s => /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(s ?? '')?.slice(1);
+  const c = parts(created), u = parts(updated);
+  if (!c) return '';
+  const day = p => `${p[2]}.${p[1]}.${p[0]}`, time = p => `${p[3]}:${p[4]}`;
+  return `${day(c)} ${time(c)}${u ? ` ~ ${day(u) === day(c) ? '' : `${day(u)} `}${time(u)}` : ''}`;
+}
+
+// Başlık sayfası (dailynice) da tek entry de aynı yapıda gelir: Data {Id, Title, Slug, PageCount, Entries}.
+async function apiDetail(path) {
+  const { data, ms } = await apiGet(path);
+  const entries = (data?.Entries ?? []).map(e => ({
+    id: String(e.Id), author: e.Author?.Nick || '?', favorites: Number(e.FavoriteCount) || 0,
+    html: renderMarkup(String(e.Content ?? '')), date: apiDate(e.Created, e.LastUpdated), url: `${SITE}/entry/${e.Id}`,
+  }));
+  if (!entries.length) throw new Error('entry bulunamadı');
+  const title = String(data.Title ?? '').trim();
+  return { page: { id: String(data.Id ?? ''), slug: data.Slug || slugify(title), title, entries, pages: Number(data.PageCount) || 1 }, ms };
+}
+
+// İki kaynak aynı biçimde veri verir. Bütçe: bir çalışmada çekilecek en çok ayrıntı sayfası (debe entry'leri + gündem sayfaları);
+// gündem ve debe listeleri buna girmez. Jina'nın sınırları dar olduğundan Jina yolunda bütçe küçük, yenileme seyrektir.
+const viaApi = {
+  name: 'mobil API', budget: 200, refreshMs: API_REFRESH_MS,
+  topics: async () => apiTopics((await apiGet('/v2/index/today?p=1')).data),
+  debeList: async () => apiDebeList((await apiGet('/v2/index/debe/')).data),
+  entry: id => apiDetail(`/v2/entry/${id}`),
+  topicPage: (item, p) => apiDetail(`/v2/topic/${item.id}/dailynice?p=${p}`),
+};
+const viaWeb = {
+  name: 'Jina', budget: 60, refreshMs: REFRESH_MS,
+  topics: async () => parseTopics(await fetchList('/', 'ana sayfa')),
+  debeList: async () => parseDebeList(await fetchList('/debe', 'debe listesi')),
+  entry: id => fetchDetail(`/entry/${id}`),
+  topicPage: (item, p) => fetchDetail(`${new URL(item.link).pathname}${TODAY}${p > 1 ? `&p=${p}` : ''}`),
+};
+const took = r => `${seconds(r.ms)} sn${r.info ? `, ${r.info}` : ''}`;
+
+// Önce mobil API denenir; köprü açılamaz ya da gündem listesi gelmezse çalışmanın tamamı Jina'dan gider. --source birini zorlar.
+async function pickSource() {
+  if (args.source !== 'jina') {
+    const started = Date.now();
+    try {
+      bridge = openBridge();
+      const topics = await viaApi.topics();
+      console.log(`Kaynak: Ekşi mobil API'si (kimlik ve gündem listesi ${seconds(Date.now() - started)} sn).`);
+      return { source: viaApi, topics };
+    } catch (error) {
+      bridge.close();
+      bridge = null;
+      if (args.source === 'api') throw new Error(`Mobil API kullanılamadı (${error.message}); yayın yapılmadı.`);
+      console.log(`Mobil API kullanılamadı (${error.message}); bu çalışma Jina üzerinden web sayfalarından gider.`);
+    }
+  }
+  const topics = await viaWeb.topics().catch(error => { throw new Error(`${error.message}; yayın yapılmadı.`); });
+  return { source: viaWeb, topics };
 }
 
 function topicList(html) {
@@ -195,6 +342,43 @@ function cleanContent(html) {
   }
   if (open) out += '</a>';
   return out.replace(/^(\s|<br>)+|(\s|<br>)+$/g, '');
+}
+
+// Mobil API entry metnini Ekşi'nin yazım biçimiyle verir; web sayfasındaki HTML'in cleanContent çıktısına çevrilir.
+// (bkz: x), `x` ve gizli bkz `:x` başlık araması; #123 entry, @nick yazar bağlantısı; [adres metin] ve düz adres bağlantı olur.
+// Ayraç içinde ayraç olamaz: "(bkz: a (bkz: b) c)" içindeki yalnız b bağlantı olur (web'deki gibi).
+const MARKUP = /\[(https?:\/\/[^\s\]]+)(?:\s+([^\]]*))?\]|\((bkz|ara):\s*([^()\n]+)\)|`:([^`\n]+)`|`([^`\n]+)`|(https?:\/\/[^\s<>"\]]+)|\n/g;
+// Sorgu, web'deki gibi kodlanır: boşluk +, kesme %27, küçük onaltılık.
+const formEncode = q => encodeURIComponent(q).replace(/'/g, '%27').replace(/%20/g, '+').replace(/%[0-9A-F]{2}/g, h => h.toLowerCase());
+const query = q => `${SITE}/?q=${formEncode(q)}`;
+// Yüklenen görsel API'de CDN adresiyle gelir; web'deki kısa adresine (soz.lk/i/<anahtar>) çevrilir.
+const imageUrl = url => url.replace(/^https:\/\/cdn\.eksisozluk\.com\/\d{4}\/\d{1,2}\/\d{1,2}\/\w\/(\w+)\.\w+\?key=\1$/, 'https://soz.lk/i/$1');
+const anchor = (href, label, title) => `<a href="${esc(href)}"${title ? ` title="${esc(title)}"` : ''}>${esc(label)}</a>`;
+function reference(ref) {
+  const entry = /^#(\d+)$/.exec(ref)?.[1], nick = /^@(.+)$/.exec(ref)?.[1];
+  return anchor(entry ? `${SITE}/entry/${entry}` : nick ? `${SITE}/biri/${encodeURIComponent(nick)}` : query(ref), ref);
+}
+function renderMarkup(src) {
+  // Web gibi: satır başındaki boşluklar düşer, üçten çok satır sonu ikiye iner.
+  src = src.replace(/\r\n?/g, '\n').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n');
+  let out = '', last = 0;
+  for (const m of src.matchAll(MARKUP)) {
+    const [all, url, label, kind, ref, hidden, hede, bare] = m;
+    out += esc(src.slice(last, m.index));
+    last = m.index + all.length;
+    if (url) out += anchor(imageUrl(url), label?.trim() || url, imageUrl(url));
+    else if (kind === 'ara') out += `(ara: ${anchor(`${SITE}/basliklar/ara?SearchForm.Keywords=${formEncode(ref.trim())}`, ref.trim())})`;
+    else if (kind) out += `(bkz: ${reference(ref.trim())})`;
+    else if (hidden) out += anchor(query(hidden.trim()), '*', `(bkz: ${hidden.trim()})`);
+    else if (hede) out += reference(hede.trim());
+    else if (bare) {
+      // Cümle sonundaki noktalama ve kapanan ayraç adrese katılmaz.
+      let href = bare.replace(/[.,;:!?]+$/, '');
+      if (href.endsWith(')') && !href.includes('(')) href = href.slice(0, -1);
+      out += anchor(href, href, href) + esc(bare.slice(href.length));
+    } else out += '<br>';
+  }
+  return (out + esc(src.slice(last))).replace(/^(\s|<br>)+|(\s|<br>)+$/g, '');
 }
 
 // Başlık sayfası da tek entry sayfası da aynı yapıda: h1#title ve entry'ler (li[data-id][data-author]); başlık sayfasında
@@ -318,13 +502,13 @@ async function loadPrevious() {
 // Debe: her gün bir önceki günün debesi. Liste yalnız dünün (İstanbul) debesi elde yokken çekilir; böylece
 // İstanbul'da 00:00'dan sonraki ilk çalışmada yeni gün aranır, gün içinde debe tamamsa hiç istek gitmez.
 // Liste elde olan bir debeyle aynıysa (Ekşi henüz yenilememiş) yeni gün açılmaz; gün, çekilen entry'lerin tarihinden çıkarılır.
-async function updateDebe(previous, now, limit) {
+async function updateDebe(previous, now, limit, source) {
   const debes = previous.filter(debe => now - debe.firstSeen <= DEBE_KEEP_MS);
   const yesterday = previousDay(istanbulDay(now));
   let work = debes.find(debe => debe.day === yesterday), fresh = false;
   if (!work) {
     try {
-      const list = parseDebeList(await fetchList('/debe', 'debe listesi'));
+      const list = await source.debeList();
       // Ayrı günlerin debeleri entry paylaşmaz: ortak entry'si olan liste elde olan debedir (Ekşi debeyi henüz yenilememiş).
       const same = debes.find(debe => list.ids.some(id => debe.ids.includes(id)));
       if (same) {
@@ -352,11 +536,11 @@ async function updateDebe(previous, now, limit) {
     const tag = `  [debe ${i + 1}/${queue.length}] ${work.captions?.get(id) ?? id}`;
     used++;
     try {
-      const { page, ms, remaining } = await fetchDetail(`/entry/${id}`);
+      const r = await source.entry(id), { page } = r;
       const entry = page.entries.find(e => e.id === id) ?? page.entries[0];
       work.entries.set(id, debeEntry(page, entry, work.captions?.get(id)));
       if (entryDay(entry.date)) days.push(entryDay(entry.date));
-      console.log(`${tag}: ${entry.author}, ${entry.date} (HTTP 200, ${seconds(ms)} sn, kalan istek hakkı ${remaining})`);
+      console.log(`${tag}: ${entry.author}, ${entry.date} (${took(r)})`);
     } catch (error) {
       console.log(`${tag}: atlandı, sonraki çalışmaya kaldı (${error.message})`);
       if (error.stop) { stop = true; break; }
@@ -453,28 +637,37 @@ const INDEX_HTML = `<!doctype html>
 `;
 
 async function main() {
-  const topics = parseTopics(await fetchList('/', 'ana sayfa').catch(error => { throw new Error(`${error.message}; yayın yapılmadı.`); }));
+  const { source, topics } = await pickSource();
+  try {
+    await build(source, topics);
+  } finally {
+    bridge?.close();
+  }
+}
+
+async function build(source, topics) {
+  const budget = Math.max(0, Number(args.budget ?? source.budget) || 0);
   const previous = await loadPrevious();
   const now = Date.now();
   const prevById = new Map(previous.topics.map(item => [item.id, item]));
 
-  // İlk görülme tarihi korunur; aynı anda görülenler gündem sırası bozulmasın diye saniyeyle kaydırılır.
+  // İlk görülme tarihi ve guid korunur (kaynak değişse de öğe aynı kalsın); aynı anda görülenler gündem sırası bozulmasın diye saniyeyle kaydırılır.
   const current = topics.map((topic, rank) => {
     const prev = prevById.get(topic.id);
-    return { ...topic, count: topic.count || prev?.count || '', entriesHtml: prev?.entriesHtml ?? '', fetchedAt: prev?.fetchedAt ?? null,
-      firstSeen: prev?.firstSeen ?? now - rank * 1000, lastSeen: now };
+    return { ...topic, guid: prev?.guid ?? topic.guid, count: topic.count || prev?.count || '', entriesHtml: prev?.entriesHtml ?? '',
+      fetchedAt: prev?.fetchedAt ?? null, firstSeen: prev?.firstSeen ?? now - rank * 1000, lastSeen: now };
   });
   const fresh = current.filter(item => !prevById.has(item.id)).length;
   console.log(`Gündem: ${topics.length} başlık (yeni ${fresh}, süren ${topics.length - fresh}); önceki beslemelerde ${previous.topics.length} gündem öğesi, ${previous.debes.length} debe günü.`);
 
   // Bütçede öncelik debede; kalan gündem sayfalarına gider.
-  const debe = await updateDebe(previous.debes, now, budget);
+  const debe = await updateDebe(previous.debes, now, budget, source);
   let left = debe.stop ? 0 : budget - debe.used;
 
-  // Gündemde öncelik hiç çekilmemiş başlıklarda (gündem sırasıyla); sonra 6 saati geçmiş olanlar (en eskisi önce).
+  // Gündemde öncelik hiç çekilmemiş başlıklarda (gündem sırasıyla); sonra yenileme süresini geçmiş olanlar (en eskisi önce).
   // Her sayfa bütçeden bir düşer; ikinci sayfa, sırada bekleyen hiç çekilmemiş başlıkların ilk sayfalarına bütçe kalıyorsa istenir.
   const never = current.filter(item => !item.fetchedAt);
-  const stale = current.filter(item => item.fetchedAt && now - item.fetchedAt >= REFRESH_MS).sort((a, b) => a.fetchedAt - b.fetchedAt);
+  const stale = current.filter(item => item.fetchedAt && now - item.fetchedAt >= source.refreshMs).sort((a, b) => a.fetchedAt - b.fetchedAt);
   const queue = [...never, ...stale];
   console.log(`Gündem entry'leri: hiç çekilmemiş ${never.length}, yenilenecek ${stale.length}; kalan bütçe ${left}/${budget} sayfa.`);
 
@@ -483,16 +676,17 @@ async function main() {
     if (stop || left <= 0) break;
     if (!item.fetchedAt) waitingNever--;
     left--;
-    const tag = `  [${i + 1}/${queue.length}] ${item.title}`, path = new URL(item.link).pathname;
+    const tag = `  [${i + 1}/${queue.length}] ${item.title}`;
     try {
-      const first = await fetchDetail(path + TODAY);
-      let { page: { entries } } = first, { ms, remaining } = first, pages = 1, note = '';
+      const first = await source.topicPage(item, 1), cost = { ...first };
+      let { page: { entries } } = first, pages = 1, note = '';
       if (first.page.pages > 1 && entries.length < ENTRIES_PER_TOPIC && left > waitingNever) {
         left--;
         try {
-          const second = await fetchDetail(`${path}${TODAY}&p=2`), seen = new Set(entries.map(e => e.id));
+          const second = await source.topicPage(item, 2), seen = new Set(entries.map(e => e.id));
           entries = [...entries, ...second.page.entries.filter(e => !seen.has(e.id))];
-          ms += second.ms; remaining = second.remaining; pages = 2;
+          Object.assign(cost, { ms: cost.ms + second.ms, info: second.info });
+          pages = 2;
         } catch (error) {
           note = `; 2. sayfa alınamadı (${error.message})`;
           stop = !!error.stop;
@@ -500,6 +694,7 @@ async function main() {
       }
       if (first.page.id && first.page.id !== item.id) console.log(`${tag}: sayfa başka başlığa (${first.page.id}) yönlendi.`);
       if (first.page.title) item.title = first.page.title;
+      if (first.page.slug) item.link = `${SITE}/${first.page.slug}--${item.id}${TODAY}`;
       // Yalnız son 24 saatte yazılmış entry'ler: tarihi okunamayan entry atılmaz (sayfa yapısı değişirse içerik boşalmasın).
       const all = entries.length;
       entries = entries.filter(e => (entryTime(e.date) ?? now) > now - DAY);
@@ -508,7 +703,7 @@ async function main() {
       item.entriesHtml = entries.map(renderEntry).join('\n');
       item.fetchedAt = Date.now();
       ok++;
-      console.log(`${tag}: ${entries.length} entry, ${pages} sayfa (HTTP 200, ${seconds(ms)} sn, kalan istek hakkı ${remaining})${note}`);
+      console.log(`${tag}: ${entries.length} entry, ${pages} sayfa (${took(cost)})${note}`);
     } catch (error) {
       failed++;
       // 24 saatten önce çekilmiş entry'ler gösterilmez; başlık yeniden çekilene dek yalnız sayıyla yayımlanır.
@@ -528,6 +723,7 @@ async function main() {
   console.log(`Sonuç: ${ok} başlığın entry'leri çekildi, ${failed} düştü; entry'si henüz olmayan ${waiting} başlık sonraki çalışmalara kaldı.`);
   console.log(`Gündem beslemesi: ${topicItems.length} öğe (gündemde ${current.length}, gündemden düşüp tutulan ${kept.length - current.length}).`);
   console.log(`Debe beslemesi: ${days.length} gün, ${debeEntries.length} entry.`);
+  if (source === viaApi) console.log(`Mobil API: ${apiRequests} istek (kimlik istekleri hariç).`);
   if (jina.keyed) console.log(`Jina anahtarı: ${jina.requests} istek, ${jina.tokens.toLocaleString('tr-TR')} token.`);
 
   await mkdir(outDir, { recursive: true });

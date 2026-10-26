@@ -22,6 +22,14 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      # Kurulum düşerse köprü açılamaz ve çalışma Jina yoluna geçer; iş düşmesin.
+      - name: Mobil API köprüsünün bağımlılıkları
+        continue-on-error: true
+        run: pip install -q -r requirements.txt
       - id: pages
         uses: actions/configure-pages@v6
       - name: Beslemeyi üret
